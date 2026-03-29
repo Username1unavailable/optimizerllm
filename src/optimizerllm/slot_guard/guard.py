@@ -26,17 +26,46 @@ if TYPE_CHECKING:
 
 
 class SlotType(str, Enum):
-    PERSON_NAME   = "person_name"
-    DATE          = "date"
-    PRICE         = "price"
-    QUANTITY      = "quantity"
-    API_FIELD     = "api_field"
-    CODE_IDENT    = "code_ident"
-    URL           = "url"
-    EMAIL         = "email"
-    CONSTRAINT    = "constraint"
-    NUMERIC       = "numeric"
-    ENUM_VALUE    = "enum_value"
+    PERSON_NAME       = "person_name"
+    DATE              = "date"
+    PRICE             = "price"
+    QUANTITY          = "quantity"
+    API_FIELD         = "api_field"
+    CODE_IDENT        = "code_ident"
+    URL               = "url"
+    EMAIL             = "email"
+    CONSTRAINT        = "constraint"
+    NUMERIC           = "numeric"
+    ENUM_VALUE        = "enum_value"
+    # Layer 2 additions
+    JSON_FIELD        = "json_field"
+    TABLE_CELL        = "table_cell"
+    TOOL_PARAM        = "tool_param"
+    # Layer 3 additions
+    ENTITY_ROLE       = "entity_role"
+    CONSTRAINT_TUPLE  = "constraint_tuple"
+
+
+# Priority ranking for density-cap selection (higher = more important to keep).
+# When max_slots_per_block is exceeded, lower-priority slots are dropped first.
+_SLOT_PRIORITY: dict[str, int] = {
+    "constraint_tuple": 100,
+    "price":            90,
+    "date":             85,
+    "constraint":       80,
+    "quantity":         75,
+    "url":              70,
+    "email":            65,
+    "numeric":          60,
+    "tool_param":       55,
+    "api_field":        50,
+    "person_name":      45,
+    "json_field":       40,
+    "table_cell":       35,
+    "entity_role":      30,
+    "code_ident":       25,
+    "enum_value":       20,
+}
 
 
 @dataclass
@@ -194,6 +223,38 @@ _API_FIELD_STOP = frozenset({
     "before", "about", "other", "first", "last", "next", "same",
 })
 
+# ---------------------------------------------------------------------------
+# Layer 2 patterns
+# ---------------------------------------------------------------------------
+
+# JSON keys that have values — these are schema fields, not just any token
+_JSON_FIELD_RE = re.compile(r'"([a-zA-Z_][a-zA-Z0-9_]*)":\s*[^{]')
+
+# Markdown table cells containing numbers or proper nouns
+_TABLE_CELL_RE = re.compile(r'\|\s*([^|\n]{2,40}?)\s*\|')
+
+# Tool parameter names: "name": "param_name"
+_TOOL_PARAM_RE = re.compile(r'"name"\s*:\s*"([a-zA-Z_][a-zA-Z0-9_]*)"')
+
+# ---------------------------------------------------------------------------
+# Layer 3 patterns
+# ---------------------------------------------------------------------------
+
+# Entity-role pairs: "X is a/the Y" or "X serves as Y"
+_ENTITY_ROLE_RE = re.compile(
+    r'([A-Z][a-zA-Z\s]{2,30}?)\s+(?:is|are|was|were)\s+(?:a|an|the)\s+([a-zA-Z\s]{2,30})',
+    re.IGNORECASE,
+)
+
+# Constraint tuples: "X must/cannot/should be Y"
+_CONSTRAINT_TUPLE_RE = re.compile(
+    r'([A-Za-z][a-zA-Z\s]{1,30}?)\s+(must|cannot|should|shall|will not|must not)\s+(?:be\s+)?([a-zA-Z\s\d]{1,50})',
+    re.IGNORECASE,
+)
+
+# Capitalized word detector for table cells
+_CAPITALIZED_WORD_RE = re.compile(r'[A-Z][a-zA-Z]+')
+
 
 def _sentences(text: str) -> list[str]:
     """Split text into rough sentences."""
@@ -226,6 +287,16 @@ class SlotGuard:
         protect_emails: bool = True,
         protect_constraints: bool = True,
         min_name_len: int = 4,   # ignore very short "names" like "Al"
+        # Layer 2
+        protect_json_fields: bool = True,
+        protect_table_cells: bool = True,
+        protect_tool_params: bool = True,
+        # Layer 3
+        protect_entity_roles: bool = False,   # off by default — noisy
+        protect_constraint_tuples: bool = True,
+        # Density cap — prevents over-protection on dense structured content
+        max_slots_per_block: int = 30,        # prose blocks capped at 30 slots
+        max_slots_per_schema_block: int = 50, # schema/table blocks get a higher cap
     ) -> None:
         self.protect_names = protect_names
         self.protect_dates = protect_dates
@@ -237,6 +308,16 @@ class SlotGuard:
         self.protect_emails = protect_emails
         self.protect_constraints = protect_constraints
         self.min_name_len = min_name_len
+        # Layer 2
+        self.protect_json_fields = protect_json_fields
+        self.protect_table_cells = protect_table_cells
+        self.protect_tool_params = protect_tool_params
+        # Layer 3
+        self.protect_entity_roles = protect_entity_roles
+        self.protect_constraint_tuples = protect_constraint_tuples
+        # Density cap
+        self.max_slots_per_block = max_slots_per_block
+        self.max_slots_per_schema_block = max_slots_per_schema_block
 
     # ------------------------------------------------------------------
 
@@ -259,19 +340,54 @@ class SlotGuard:
         text = block.content
         sents = _sentences(text)
 
+        # Extract into a local temp index, then apply density cap before merging
+        from optimizerllm.core.block import BlockType
+        temp_index = SlotIndex()
+
         for sent in sents:
-            self._extract_prices(sent, block.id, index)
-            self._extract_dates(sent, block.id, index)
-            self._extract_quantities(sent, block.id, index)
-            self._extract_numerics(sent, block.id, index)
-            self._extract_urls(sent, block.id, index)
-            self._extract_emails(sent, block.id, index)
-            self._extract_api_fields(sent, block.id, index)
-            self._extract_constraints(sent, block.id, index)
-            self._extract_names(sent, block.id, index)
+            self._extract_prices(sent, block.id, temp_index)
+            self._extract_dates(sent, block.id, temp_index)
+            self._extract_quantities(sent, block.id, temp_index)
+            self._extract_numerics(sent, block.id, temp_index)
+            self._extract_urls(sent, block.id, temp_index)
+            self._extract_emails(sent, block.id, temp_index)
+            self._extract_api_fields(sent, block.id, temp_index)
+            self._extract_constraints(sent, block.id, temp_index)
+            self._extract_names(sent, block.id, temp_index)
+            # Layer 2
+            self._extract_json_fields(sent, block.id, temp_index)
+            self._extract_table_cells(sent, block.id, temp_index)
+            self._extract_tool_params(sent, block.id, temp_index)
+            # Layer 3
+            self._extract_entity_roles(sent, block.id, temp_index)
+            self._extract_constraint_tuples(sent, block.id, temp_index)
+
+        # Apply density cap: sort by priority, keep top N, merge into main index
+        is_schema_block = block.block_type in (
+            BlockType.TOOL_SCHEMA, BlockType.STRUCTURED_DATA,
+        )
+        cap = self.max_slots_per_schema_block if is_schema_block else self.max_slots_per_block
+
+        block_slots = sorted(
+            temp_index.slots,
+            key=lambda s: _SLOT_PRIORITY.get(s.slot_type.value, 0),
+            reverse=True,
+        )
+        # Deduplicate: exact same normalized text → keep only one (highest priority already first)
+        seen_text: set[str] = set()
+        capped: list[Slot] = []
+        for slot in block_slots:
+            if slot.normalized not in seen_text:
+                seen_text.add(slot.normalized)
+                capped.append(slot)
+            if len(capped) >= cap:
+                break
+
+        for slot in capped:
+            index.add(slot)
 
     # ------------------------------------------------------------------
-    # Per-type extractors
+    # Per-type extractors (Layer 1)
     # ------------------------------------------------------------------
 
     def _extract_prices(self, sent: str, block_id: str, index: SlotIndex) -> None:
@@ -345,3 +461,66 @@ class SlotGuard:
                 continue
             # Reject if it looks like a sentence start (preceded by period+space)
             index.add(Slot(val, SlotType.PERSON_NAME, block_id, sent))
+
+    # ------------------------------------------------------------------
+    # Per-type extractors (Layer 2)
+    # ------------------------------------------------------------------
+
+    def _extract_json_fields(self, sent: str, block_id: str, index: SlotIndex) -> None:
+        """Extract JSON schema field names: "field_name": <non-object value>."""
+        if not self.protect_json_fields:
+            return
+        for m in _JSON_FIELD_RE.finditer(sent):
+            field_name = m.group(1)
+            if len(field_name) >= 2:
+                index.add(Slot(field_name, SlotType.JSON_FIELD, block_id, sent))
+
+    def _extract_table_cells(self, sent: str, block_id: str, index: SlotIndex) -> None:
+        """Extract markdown table cells containing numbers or proper nouns."""
+        if not self.protect_table_cells:
+            return
+        for m in _TABLE_CELL_RE.finditer(sent):
+            cell = m.group(1).strip()
+            if not cell:
+                continue
+            # Only keep cells with a number or a capitalized word
+            has_number = bool(re.search(r'\d', cell))
+            has_capital = bool(_CAPITALIZED_WORD_RE.search(cell))
+            if has_number or has_capital:
+                index.add(Slot(cell, SlotType.TABLE_CELL, block_id, sent))
+
+    def _extract_tool_params(self, sent: str, block_id: str, index: SlotIndex) -> None:
+        """Extract tool parameter names from "name": "param_name" patterns."""
+        if not self.protect_tool_params:
+            return
+        for m in _TOOL_PARAM_RE.finditer(sent):
+            param_name = m.group(1)
+            if len(param_name) >= 2:
+                index.add(Slot(param_name, SlotType.TOOL_PARAM, block_id, sent))
+
+    # ------------------------------------------------------------------
+    # Per-type extractors (Layer 3)
+    # ------------------------------------------------------------------
+
+    def _extract_entity_roles(self, sent: str, block_id: str, index: SlotIndex) -> None:
+        """Extract entity-role pairs: 'X is a/the Y' → stored as 'X → Y'."""
+        if not self.protect_entity_roles:
+            return
+        for m in _ENTITY_ROLE_RE.finditer(sent):
+            entity = m.group(1).strip()
+            role = m.group(2).strip()
+            if len(entity) >= 2 and len(role) >= 2:
+                text = f"{entity} → {role}"
+                index.add(Slot(text, SlotType.ENTITY_ROLE, block_id, sent))
+
+    def _extract_constraint_tuples(self, sent: str, block_id: str, index: SlotIndex) -> None:
+        """Extract constraint tuples: 'X must/cannot/should be Y'."""
+        if not self.protect_constraint_tuples:
+            return
+        for m in _CONSTRAINT_TUPLE_RE.finditer(sent):
+            subject = m.group(1).strip()
+            verb = m.group(2).strip()
+            obj = m.group(3).strip()
+            if subject and verb and obj:
+                text = f"{subject} {verb} {obj}"
+                index.add(Slot(text, SlotType.CONSTRAINT_TUPLE, block_id, sent))

@@ -197,3 +197,174 @@ class BudgetController:
             score=block.score,
             priority=block.metadata.priority,
         )
+
+
+# ---------------------------------------------------------------------------
+# BudgetPlannerV2 — family-aware pre-allocation
+# ---------------------------------------------------------------------------
+
+# Map block type values to budget families
+_FAMILY_MAP: dict[str, str] = {
+    "system_prompt": "schema_core",
+    "tool_schema": "schema_core",
+    "retrieved_doc": "evidence",
+    "few_shot_example": "evidence",
+    "structured_data": "constraints",
+    "conversation_history": "memory",
+    "user_message": "background",
+    "assistant_message": "background",
+    "tool_result": "constraints",
+}
+
+# Hard floors: guaranteed regardless of content size (schema_core only).
+# Soft targets: reserved UP TO this fraction, but only if the family actually
+# has that much content — unused fraction flows back to other families.
+_FAMILY_HARD_FLOORS: dict[str, float] = {
+    "schema_core": 0.10,   # Hard floor — schemas must survive
+}
+_FAMILY_SOFT_TARGETS: dict[str, float] = {
+    "schema_core": 0.20,   # Soft target for schema (beyond the hard floor)
+    "evidence": 0.30,       # Soft target for retrieved docs / examples
+    "constraints": 0.08,    # Soft target for structured data
+    "memory": 0.08,         # Soft target for history
+    "background": 0.05,     # Soft target for messages
+}
+# Back-compat alias used elsewhere in the class
+_FAMILY_MINIMUMS = _FAMILY_SOFT_TARGETS
+
+
+class BudgetPlannerV2:
+    """
+    Family-aware budget planner that wraps BudgetController.
+
+    Instead of purely greedy priority-based selection, it:
+      1. Guarantees minimum budget fractions for each block family.
+      2. Distributes remaining budget greedily by priority.
+      3. Delegates overflow handling to BudgetController internals.
+
+    This prevents evidence blocks from being starved by a very large
+    schema_core block, and vice versa.
+    """
+
+    def __init__(
+        self,
+        max_input_tokens: int,
+        output_reserved: int = 1024,
+        mode: CompressionMode = CompressionMode.CONSERVATIVE,
+    ) -> None:
+        self.max_input_tokens = max_input_tokens
+        self.output_reserved = output_reserved
+        self.mode = mode
+        self._ctrl = BudgetController(
+            max_input_tokens=max_input_tokens,
+            output_reserved=output_reserved,
+            mode=mode,
+        )
+
+    @property
+    def available_tokens(self) -> int:
+        return self._ctrl.available_tokens
+
+    def allocate(self, blocks: list["Block"]) -> BudgetResult:
+        """
+        Fit blocks into the available token budget using family-aware pre-allocation.
+
+        Algorithm:
+          1. Group blocks by family.
+          2. Compute minimum token budget per family.
+          3. First pass: fill family minimums (high-priority blocks first).
+          4. Second pass: remaining budget distributed greedily by priority.
+          5. Delegate actual keep/drop/truncate decisions to BudgetController.
+        """
+        available = self.available_tokens
+
+        # --- Phase 0: Protected / immutable blocks (must include, skip family logic) ---
+        protected: list["Block"] = []
+        carvable: list["Block"] = []
+
+        for b in blocks:
+            if b.metadata.protected or b.metadata.mutability == Mutability.IMMUTABLE:
+                protected.append(b)
+            else:
+                carvable.append(b)
+
+        protected_tokens = sum(b.token_count or 0 for b in protected)
+        remaining_after_protected = max(0, available - protected_tokens)
+
+        if remaining_after_protected == 0:
+            # Nothing left for carvable — fall back to base controller
+            return self._ctrl.allocate(blocks)
+
+        # --- Phase 1: Group carvable blocks by family ---
+        families: dict[str, list["Block"]] = {family: [] for family in _FAMILY_MINIMUMS}
+        for b in carvable:
+            family = _FAMILY_MAP.get(b.block_type.value, "background")
+            families[family].append(b)
+
+        # Sort each family by effective_priority desc
+        for family in families:
+            families[family].sort(key=lambda b: b.effective_priority(), reverse=True)
+
+        # --- Phase 2: Compute SOFT minimum budgets ---
+        # Reservation is capped to actual content in the family — unused quota
+        # flows back to the general pool so it doesn't choke overall compression.
+        family_min_tokens: dict[str, int] = {}
+        for family, fraction in _FAMILY_SOFT_TARGETS.items():
+            target = int(remaining_after_protected * fraction)
+            # Cap to actual tokens available in this family
+            actual = sum(b.token_count or 0 for b in families[family])
+            # Hard floor: schema_core gets at least the hard floor if content exists
+            hard = int(remaining_after_protected * _FAMILY_HARD_FLOORS.get(family, 0.0))
+            family_min_tokens[family] = max(min(target, actual), hard)
+
+        # --- Phase 3: First pass — fill minimums ---
+        selected_in_pass1: list["Block"] = []
+        tokens_committed_pass1 = 0
+
+        for family in _FAMILY_SOFT_TARGETS:
+            family_budget = family_min_tokens[family]
+            family_tokens_used = 0
+            for b in families[family]:
+                bt = b.token_count or 0
+                if family_tokens_used + bt <= family_budget:
+                    selected_in_pass1.append(b)
+                    family_tokens_used += bt
+                    tokens_committed_pass1 += bt
+
+        selected_ids_pass1 = {id(b) for b in selected_in_pass1}
+
+        # --- Phase 4: Second pass — remaining budget, greedy by priority ---
+        remaining_budget = remaining_after_protected - tokens_committed_pass1
+        remaining_carvable = [b for b in carvable if id(b) not in selected_ids_pass1]
+        remaining_carvable.sort(key=lambda b: b.effective_priority(), reverse=True)
+
+        selected_in_pass2: list["Block"] = []
+        for b in remaining_carvable:
+            bt = b.token_count or 0
+            if bt <= remaining_budget:
+                selected_in_pass2.append(b)
+                remaining_budget -= bt
+
+        # --- Phase 5: Delegate to BudgetController with ordered blocks ---
+        # Re-order: protected + pass1 + pass2, everything else marked to drop
+        final_candidate_ids = (
+            {id(b) for b in protected}
+            | {id(b) for b in selected_in_pass1}
+            | {id(b) for b in selected_in_pass2}
+        )
+
+        # Build ordered list for BudgetController
+        ordered_blocks: list["Block"] = []
+        # Protected first (they'll be picked up in phase 1 of BudgetController)
+        ordered_blocks.extend(protected)
+        # Then pass1 selected (highest-priority blocks from each family minimum)
+        ordered_blocks.extend(selected_in_pass1)
+        # Then pass2 selected (remaining budget, greedy)
+        ordered_blocks.extend(selected_in_pass2)
+        # Then unselected blocks (they'll likely be dropped)
+        unselected = [b for b in carvable if id(b) not in final_candidate_ids]
+        # Sort unselected by priority so the controller can still try to fit them
+        unselected.sort(key=lambda b: b.effective_priority(), reverse=True)
+        ordered_blocks.extend(unselected)
+
+        return self._ctrl.allocate(ordered_blocks)

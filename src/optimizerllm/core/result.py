@@ -53,6 +53,12 @@ class TelemetryReport:
     risk_level: str = "low"        # "low" | "medium" | "high"
     risk_reasons: list[str] = field(default_factory=list)
 
+    # Calibration telemetry (v2)
+    compression_regret: float = 0.0       # Estimated useful info lost (0.0–1.0)
+    fact_loss_count: int = 0              # Number of slots lost before recovery
+    schema_core_preserved: bool = True    # Whether schema-critical content survived
+    coherence_break_risk: float = 0.0    # Risk of incoherent output (0.0–1.0)
+
     # Extension bag — populated by optional pipeline modules
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -82,6 +88,19 @@ class TelemetryReport:
         else:
             self.risk_level = "low"
 
+        # Calibration telemetry: coherence_break_risk
+        if self.reduction_pct > 50:
+            self.coherence_break_risk = 0.3
+        elif self.reduction_pct > 30:
+            self.coherence_break_risk = 0.1
+        else:
+            self.coherence_break_risk = 0.0
+
+        # schema_core_preserved: False if any removed block has type tool_schema or system_prompt
+        schema_core_types = {"tool_schema", "system_prompt"}
+        if any(r.block_type in schema_core_types for r in self.blocks_removed):
+            self.schema_core_preserved = False
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
@@ -110,6 +129,11 @@ class TelemetryReport:
             "model": self.model,
             "risk_level": self.risk_level,
             "risk_reasons": self.risk_reasons,
+            # Calibration telemetry (v2)
+            "compression_regret": self.compression_regret,
+            "fact_loss_count": self.fact_loss_count,
+            "schema_core_preserved": self.schema_core_preserved,
+            "coherence_break_risk": self.coherence_break_risk,
             "extra": self.extra,
         }
 

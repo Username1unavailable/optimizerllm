@@ -10,6 +10,7 @@ This runs after block-level scoring and before the budget controller.
 
 from __future__ import annotations
 
+import re
 from dataclasses import replace as dc_replace
 from typing import TYPE_CHECKING
 
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
     from optimizerllm.slot_guard.guard import SlotIndex
 
 from optimizerllm.compression.selector import _bm25_scores, _tfidf_cosine, _tokenize
+from optimizerllm.compression.span_critic import SpanCritic
 from optimizerllm.compression.splitter import (
     ContentSplitter,
     Section,
@@ -33,13 +35,25 @@ _GRANULAR_ELIGIBLE = {
     BlockType.ASSISTANT_MESSAGE,
 }
 
+# Block types eligible for span-level trimming
+_SPAN_ELIGIBLE = {
+    BlockType.RETRIEVED_DOC,
+    BlockType.STRUCTURED_DATA,
+}
+
 # Minimum character length a block must have before section splitting is useful
 _MIN_CHARS_FOR_SECTION_SPLIT = 300
 
-# Minimum character length before sentence splitting is useful
-_MIN_CHARS_FOR_SENTENCE_SPLIT = 150
+# Minimum character length before sentence splitting is useful.
+# 350 chars ≈ 4–6 typical sentences.  Below this, any single dropped
+# sentence is a large fraction of the block — not worth the risk.
+_MIN_CHARS_FOR_SENTENCE_SPLIT = 350
+
+# Minimum sentence length before span trimming is useful
+_MIN_CHARS_FOR_SPAN_TRIM = 150
 
 _ELLIPSIS = "[…]"
+_SPAN_ELLIPSIS = " … "
 
 
 def _score_texts(query_tokens: list[str], texts: list[str]) -> list[float]:
@@ -53,17 +67,68 @@ def _score_texts(query_tokens: list[str], texts: list[str]) -> list[float]:
     return [0.6 * b + 0.4 * t for b, t in zip(bm25, tfidf)]
 
 
+def _has_number(text: str) -> bool:
+    """Return True if text contains a digit."""
+    return bool(re.search(r'\d', text))
+
+
+def _extract_spans(text: str, query_tokens: set[str]) -> str:
+    """
+    Trim a long sentence to its most relevant clauses.
+
+    If sentence is longer than 150 chars:
+      - Split into comma-separated or semicolon-separated clauses
+      - Score each clause by overlap with query_tokens
+      - Keep clauses scoring > 0 or those with numbers
+      - Rejoin with " … " if clauses were dropped
+
+    If sentence is shorter than 150 chars: return as-is.
+    """
+    if len(text) <= _MIN_CHARS_FOR_SPAN_TRIM:
+        return text
+
+    clauses = re.split(r'[,;]', text)
+    if len(clauses) <= 1:
+        return text
+
+    kept_clauses: list[str] = []
+    dropped_any = False
+
+    for clause in clauses:
+        clause_stripped = clause.strip()
+        if not clause_stripped:
+            continue
+        clause_tokens = set(_tokenize(clause_stripped))
+        overlap = len(clause_tokens & query_tokens)
+        if overlap > 0 or _has_number(clause_stripped):
+            kept_clauses.append(clause_stripped)
+        else:
+            dropped_any = True
+
+    if not kept_clauses:
+        # Nothing passed — return original to avoid empty sentence
+        return text
+
+    if not dropped_any:
+        return text
+
+    return _SPAN_ELLIPSIS.join(kept_clauses)
+
+
 class GranularSelector:
     """
-    Trims individual blocks at the section and sentence level.
+    Trims individual blocks at the section, sentence, and optionally span level.
 
     Pipeline per eligible block:
       1. If block is long enough → split into sections → score each section.
          Drop sections below `section_threshold`.
       2. If any remaining section is still long enough → split into sentences
-         → score each sentence. Keep top-k sentences (with 1-sentence context
-         buffer on each side to avoid orphaned fragments).
-      3. Reassemble the kept content and return a trimmed block.
+         → score each sentence. When a SpanCritic is provided, MMR-style
+         redundancy-aware selection is used; otherwise falls back to simple
+         threshold filtering.
+      3. [Optional] If span_level=True and block is RETRIEVED_DOC or STRUCTURED_DATA:
+         apply span-level trimming to each surviving sentence.
+      4. Reassemble the kept content and return a trimmed block.
 
     Slot-awareness: if a SlotIndex is provided, any sentence that contains a
     protected slot is always kept regardless of its relevance score.
@@ -72,18 +137,43 @@ class GranularSelector:
     keep something than return nothing).
     """
 
+    # Class-level capture buffer for training data collection.
+    # None means capture is off.  Enable via start_capture() / stop_capture().
+    _capture: "list[dict] | None" = None
+    _block_seq: int = 0  # monotone counter — unique block_id across a capture session
+
+    @classmethod
+    def start_capture(cls) -> None:
+        """Enable sentence-level decision logging (for SpanCritic training)."""
+        cls._capture = []
+        cls._block_seq = 0
+
+    @classmethod
+    def stop_capture(cls) -> "list[dict]":
+        """Disable logging and return the collected decision records."""
+        records = cls._capture or []
+        cls._capture = None
+        return records
+
     def __init__(
         self,
         section_threshold: float = 0.10,
         sentence_threshold: float = 0.08,
         min_sentences_to_keep: int = 1,
         context_buffer: int = 1,
+        span_level: bool = False,
     ) -> None:
         self.section_threshold = section_threshold
         self.sentence_threshold = sentence_threshold
         self.min_sentences = min_sentences_to_keep
         self.context_buffer = context_buffer
+        self.span_level = span_level
         self._splitter = ContentSplitter()
+        self._span_critic: SpanCritic | None = None
+
+    def set_span_critic(self, critic: SpanCritic) -> None:
+        """Attach a SpanCritic for MMR-style sentence selection."""
+        self._span_critic = critic
 
     def trim_blocks(
         self,
@@ -92,16 +182,22 @@ class GranularSelector:
         *,
         section_level: bool = True,
         sentence_level: bool = True,
+        span_level: bool | None = None,
         slot_index: "SlotIndex | None" = None,
     ) -> list["Block"]:
         """
         Apply granular trimming to all eligible blocks.
+
+        Args:
+            span_level: If provided, overrides self.span_level for this call.
+                        None → use self.span_level (the instance default).
 
         Returns new block objects (originals untouched).
         """
         if not query.strip():
             return blocks
 
+        effective_span_level = self.span_level if span_level is None else span_level
         query_tokens = _tokenize(query)
         result: list["Block"] = []
 
@@ -122,8 +218,23 @@ class GranularSelector:
                 )
 
             if sentence_level and len(trimmed_content) >= _MIN_CHARS_FOR_SENTENCE_SPLIT:
-                trimmed_content = self._trim_sentences(
-                    trimmed_content, query_tokens, slot_index=slot_index
+                if self._span_critic is not None:
+                    trimmed_content = self._trim_sentences_with_critic(
+                        trimmed_content, query_tokens, slot_index=slot_index
+                    )
+                else:
+                    trimmed_content = self._trim_sentences(
+                        trimmed_content, query_tokens, slot_index=slot_index
+                    )
+
+            # Span-level trimming (only when enabled and block type is eligible)
+            if (
+                effective_span_level
+                and block.block_type in _SPAN_ELIGIBLE
+                and len(trimmed_content) >= _MIN_CHARS_FOR_SENTENCE_SPLIT
+            ):
+                trimmed_content = self._trim_spans(
+                    trimmed_content, query_tokens, slot_index
                 )
 
             if trimmed_content.strip() and trimmed_content != block.content:
@@ -226,6 +337,26 @@ class GranularSelector:
                 if 0 <= neighbour < n:
                     buffered.add(neighbour)
 
+        # Emit to capture buffer (heuristic path — no SpanCritic scores available)
+        if GranularSelector._capture is not None:
+            block_id = GranularSelector._block_seq
+            GranularSelector._block_seq += 1
+            for i in range(n):
+                GranularSelector._capture.append({
+                    "text": texts[i],
+                    "block_id": block_id,
+                    "by_selection": i in keep_set,
+                    "kept": i in buffered,
+                    # No SpanCritic scores — fill with heuristic proxies
+                    "keep_prob": float(scores[i]),
+                    "fragility_prob": 0.0,
+                    "redundancy_prob": 0.0,
+                    "position": i,
+                    "total": n,
+                    "loss_type_probs": {},
+                    "query_tokens": query_tokens,
+                })
+
         if len(buffered) == n:
             # Nothing was pruned
             return text
@@ -244,3 +375,153 @@ class GranularSelector:
             return text
 
         return " ".join(kept_sentences)
+
+    # ------------------------------------------------------------------
+    # Sentence-level trimming — SpanCritic path (MMR-style)
+    # ------------------------------------------------------------------
+
+    def _trim_sentences_with_critic(
+        self,
+        text: str,
+        query_tokens: list[str],
+        slot_index: "SlotIndex | None" = None,
+    ) -> str:
+        """
+        MMR-style sentence selection using SpanCritic.
+
+        Algorithm:
+          1. Score all sentences via SpanCritic (initial scores, redundancy=0)
+          2. Seed keep_set with the highest keep_prob sentence
+          3. Iterate remaining sentences in order; update redundancy against
+             already-selected, then keep if net_keep_score >= threshold OR
+             fragility_prob >= 0.60 OR sentence contains a slot
+          4. Enforce minimum, add context buffer, reconstruct
+        """
+        assert self._span_critic is not None
+
+        sentences = self._splitter.split_sentences(text)
+        if len(sentences) <= 2:
+            return text
+
+        n = len(sentences)
+        texts = [s.text for s in sentences]
+
+        # Step 1: initial scores
+        scores = self._span_critic.score_batch(
+            texts, query_tokens, slot_index=slot_index
+        )
+
+        # Step 2: seed with highest keep_prob sentence
+        max_idx = max(range(n), key=lambda i: scores[i].keep_prob)
+        keep_set: set[int] = {max_idx}
+        selected_texts: list[str] = [texts[max_idx]]
+
+        # Step 3: greedy MMR selection over remaining sentences
+        updated_scores: list = list(scores)  # will hold updated redundancy
+        for i in range(n):
+            if i in keep_set:
+                continue
+            updated = self._span_critic.update_redundancy(
+                scores[i], texts[i], selected_texts
+            )
+            updated_scores[i] = updated
+            is_slot_sentence = (
+                slot_index is not None and slot_index.sentence_has_slot(texts[i])
+            )
+            should_keep = (
+                updated.net_keep_score >= self.sentence_threshold
+                or updated.should_force_keep
+                or is_slot_sentence
+            )
+            if should_keep:
+                keep_set.add(i)
+                selected_texts.append(texts[i])
+
+        # Step 4: enforce minimum
+        if len(keep_set) < self.min_sentences:
+            ranked = sorted(range(n), key=lambda i: scores[i].keep_prob, reverse=True)
+            for idx in ranked:
+                keep_set.add(idx)
+                if len(keep_set) >= self.min_sentences:
+                    break
+
+        # Add context buffer
+        buffered: set[int] = set()
+        for idx in keep_set:
+            for offset in range(-self.context_buffer, self.context_buffer + 1):
+                neighbour = idx + offset
+                if 0 <= neighbour < n:
+                    buffered.add(neighbour)
+
+        # Emit to capture buffer (training data collection).
+        # Done AFTER buffer expansion so `kept` reflects the true final output.
+        if GranularSelector._capture is not None:
+            block_id = GranularSelector._block_seq
+            GranularSelector._block_seq += 1
+            for i in range(n):
+                sc = updated_scores[i]
+                GranularSelector._capture.append({
+                    "text": texts[i],
+                    "block_id": block_id,
+                    "by_selection": i in keep_set,   # chosen by MMR logic (clean label signal)
+                    "kept": i in buffered,            # final output (includes context buffer)
+                    "keep_prob": sc.keep_prob,
+                    "fragility_prob": sc.fragility_prob,
+                    "redundancy_prob": sc.redundancy_prob,
+                    "position": i,
+                    "total": n,
+                    "loss_type_probs": sc.loss_type_probs,
+                    "query_tokens": query_tokens,
+                })
+
+        if len(buffered) == n:
+            return text
+
+        kept_sentences: list[str] = []
+        prev_idx: int | None = None
+        for idx in sorted(buffered):
+            if prev_idx is not None and idx > prev_idx + 1:
+                kept_sentences.append(_ELLIPSIS)
+            kept_sentences.append(texts[idx])
+            prev_idx = idx
+
+        if not kept_sentences:
+            return text
+
+        return " ".join(kept_sentences)
+
+    # ------------------------------------------------------------------
+    # Span-level trimming
+    # ------------------------------------------------------------------
+
+    def _trim_spans(
+        self,
+        text: str,
+        query_tokens: list[str],
+        slot_index: "SlotIndex | None",
+    ) -> str:
+        """
+        Apply span-level trimming to each sentence in text.
+
+        For each sentence longer than 150 chars that is NOT a slot sentence,
+        trim it to the most relevant comma/semicolon-separated clauses.
+        """
+        sentences = self._splitter.split_sentences(text)
+        if not sentences:
+            return text
+
+        query_token_set = set(query_tokens)
+        trimmed_parts: list[str] = []
+
+        for sent in sentences:
+            sent_text = sent.text
+            # Do not trim slot-containing sentences
+            is_slot_sentence = (
+                slot_index is not None and slot_index.sentence_has_slot(sent_text)
+            )
+            if is_slot_sentence or len(sent_text) <= _MIN_CHARS_FOR_SPAN_TRIM:
+                trimmed_parts.append(sent_text)
+            else:
+                trimmed_parts.append(_extract_spans(sent_text, query_token_set))
+
+        return " ".join(trimmed_parts)

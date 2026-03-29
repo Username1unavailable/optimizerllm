@@ -33,9 +33,44 @@ class RecoveryRecord:
     injected_into_block_id: str | None
 
 
+# Human-readable group labels for each slot type family
+_SLOT_TYPE_LABELS: dict[str, str] = {
+    "numeric": "Numeric facts recovered",
+    "quantity": "Numeric facts recovered",
+    "price": "Numeric facts recovered",
+    "date": "Dates and timestamps recovered",
+    "api_field": "API/Schema fields recovered",
+    "json_field": "API/Schema fields recovered",
+    "tool_param": "API/Schema fields recovered",
+    "code_ident": "API/Schema fields recovered",
+    "url": "URLs and references recovered",
+    "email": "Contact information recovered",
+    "person_name": "Names and entities recovered",
+    "entity_role": "Names and entities recovered",
+    "constraint": "Constraints and requirements recovered",
+    "constraint_tuple": "Constraints and requirements recovered",
+    "table_cell": "Structured data recovered",
+    "enum_value": "Structured data recovered",
+}
+
+# Canonical group ordering for the recovery note
+_GROUP_ORDER = [
+    "Numeric facts recovered",
+    "Dates and timestamps recovered",
+    "API/Schema fields recovered",
+    "Constraints and requirements recovered",
+    "Names and entities recovered",
+    "URLs and references recovered",
+    "Contact information recovered",
+    "Structured data recovered",
+]
+
+
 class Recover:
     """
-    Post-compression slot recovery pass.
+    Post-compression slot recovery pass (SelectiveExpand).
+
+    Groups lost slots by slot_type and injects per-type targeted recovery notes.
 
     Usage::
 
@@ -75,7 +110,7 @@ class Recover:
         records: list[RecoveryRecord] = []
         # Deduplicate: only recover each distinct slot text once
         seen: set[str] = set()
-        to_recover: list[Slot] = []
+        to_recover: list["Slot"] = []
         for slot in lost_slots[: self.max_slots]:
             if slot.normalized not in seen:
                 to_recover.append(slot)
@@ -84,17 +119,8 @@ class Recover:
         if not to_recover:
             return final_blocks, []
 
-        # Build a compact recovery note
-        recovery_lines = []
-        for slot in to_recover:
-            sentence = slot.sentence.strip()[: self.max_sentence_chars]
-            recovery_lines.append(f"• [{slot.slot_type.value}] {sentence}")
-
-        note_content = (
-            self.recovery_note_prefix
-            + "The following key details were compressed out of earlier context:\n"
-            + "\n".join(recovery_lines)
-        )
+        # Build selective recovery note grouped by type
+        note_content = self._build_selective_recovery_note(to_recover)
 
         recovery_block = self._make_recovery_block(note_content)
 
@@ -117,6 +143,50 @@ class Recover:
             )
 
         return final_blocks, records
+
+    # ------------------------------------------------------------------
+    # Selective recovery note building
+    # ------------------------------------------------------------------
+
+    def _group_by_type(self, slots: list["Slot"]) -> dict[str, list["Slot"]]:
+        """Group slots by their display group label."""
+        groups: dict[str, list["Slot"]] = {}
+        for slot in slots:
+            label = _SLOT_TYPE_LABELS.get(slot.slot_type.value, "Other facts recovered")
+            groups.setdefault(label, []).append(slot)
+        return groups
+
+    def _format_group(self, type_name: str, slots: list["Slot"]) -> str:
+        """Format a single group of slots as a titled bullet list."""
+        lines = [f"[{type_name}]"]
+        for slot in slots:
+            sentence = slot.sentence.strip()[: self.max_sentence_chars]
+            lines.append(f"- {sentence}")
+        return "\n".join(lines)
+
+    def _build_selective_recovery_note(self, slots: list["Slot"]) -> str:
+        """Build the recovery note using per-type grouping."""
+        groups = self._group_by_type(slots)
+
+        # Render in canonical order, then any remaining groups
+        rendered_groups: list[str] = []
+        seen_groups: set[str] = set()
+
+        for group_name in _GROUP_ORDER:
+            if group_name in groups:
+                rendered_groups.append(self._format_group(group_name, groups[group_name]))
+                seen_groups.add(group_name)
+
+        # Any groups not in the canonical order
+        for group_name, group_slots in groups.items():
+            if group_name not in seen_groups:
+                rendered_groups.append(self._format_group(group_name, group_slots))
+
+        header = (
+            self.recovery_note_prefix
+            + "The following key details were compressed out of earlier context:"
+        )
+        return header + "\n\n" + "\n\n".join(rendered_groups)
 
     # ------------------------------------------------------------------
 

@@ -140,6 +140,10 @@ class TaskDescriptor:
     retention_policy: RetentionPolicy
     confidence: float = 0.0                 # 0–1 how confident we are
     signals: list[str] = field(default_factory=list)  # Which signals fired
+    # v2 fields — failure mode inference
+    primary_failure_mode: str = "none"      # "entity_confusion" | "numeric_drop" | "schema_corruption" | "context_gap" | "reasoning_break" | "none"
+    retrieval_noise_profile: str = "low"    # "high" | "medium" | "low"
+    reasoning_dependency_density: float = 0.0  # 0.0–1.0
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +203,12 @@ _SIGNAL_MAP = [
     (TaskType.EXTRACTION,     _EXTRACT_SIGNALS),
     (TaskType.CHAT,           _CHAT_SIGNALS),
 ]
+
+# Patterns for reasoning dependency density
+_REASONING_PATTERNS = re.compile(
+    r'\b(because|therefore|since|step\s+\d|if\s+.{1,30}\s+then)\b',
+    re.IGNORECASE,
+)
 
 
 class TaskSynth:
@@ -261,13 +271,53 @@ class TaskSynth:
         policy = _TASK_POLICIES[best]
         description = self._describe(best, has_docs, has_tools, has_history)
 
+        # ------------------------------------------------------------------
+        # v2: Failure mode inference
+        # ------------------------------------------------------------------
+        primary_failure_mode = self._infer_failure_mode(best, has_history)
+
+        # Retrieval noise profile
+        retrieved_doc_count = sum(
+            1 for b in blocks if b.block_type == BlockType.RETRIEVED_DOC
+        )
+        if retrieved_doc_count > 5:
+            retrieval_noise_profile = "high"
+        elif retrieved_doc_count >= 3:
+            retrieval_noise_profile = "medium"
+        else:
+            retrieval_noise_profile = "low"
+
+        # Reasoning dependency density
+        all_content = " ".join(b.content for b in blocks)
+        reasoning_matches = _REASONING_PATTERNS.findall(all_content)
+        reasoning_count = len(reasoning_matches)
+        reasoning_dependency_density = min(1.0, reasoning_count / 10.0)
+
         return TaskDescriptor(
             task_type=best,
             description=description,
             retention_policy=policy,
             confidence=confidence,
             signals=fired,
+            primary_failure_mode=primary_failure_mode,
+            retrieval_noise_profile=retrieval_noise_profile,
+            reasoning_dependency_density=round(reasoning_dependency_density, 3),
         )
+
+    @staticmethod
+    def _infer_failure_mode(task: TaskType, has_history: bool) -> str:
+        """Determine the most likely compression failure mode for this task type."""
+        if task == TaskType.MATH:
+            return "numeric_drop"
+        if task in (TaskType.CODE, TaskType.TOOL_USE):
+            return "schema_corruption"
+        if task == TaskType.RAG:
+            return "context_gap"
+        if task == TaskType.EXTRACTION:
+            return "entity_confusion"
+        if task == TaskType.CHAT and has_history:
+            return "reasoning_break"
+        return "none"
 
     @staticmethod
     def _describe(

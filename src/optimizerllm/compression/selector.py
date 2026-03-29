@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from optimizerllm.core.block import Block
+    from optimizerllm.slot_guard.guard import SlotIndex
     from optimizerllm.task_synth.synth import TaskDescriptor
 
 # Block types that carry retrieved or historical content
@@ -18,6 +19,9 @@ _SELECTABLE_TYPES = {
     "few_shot_example",
     "structured_data",
 }
+
+# Markers that indicate structured / schema content
+_STRUCTURE_MARKERS = ("{", "[", "|", " def ", " class ", "json", "schema", '"type":', '"properties":')
 
 
 def _tokenize(text: str) -> list[str]:
@@ -116,18 +120,67 @@ def _recency_score(position: int | None, total_blocks: int) -> float:
 
 
 # ---------------------------------------------------------------------------
+# MMR helpers
+# ---------------------------------------------------------------------------
+
+def _jaccard(set_a: set[str], set_b: set[str]) -> float:
+    """Jaccard similarity between two token sets."""
+    if not set_a or not set_b:
+        return 0.0
+    return len(set_a & set_b) / len(set_a | set_b)
+
+
+def _compute_redundancy(token_sets: list[set[str]]) -> list[float]:
+    """
+    For each block i, compute the max pairwise Jaccard similarity to all
+    other blocks j != i.
+    """
+    n = len(token_sets)
+    if n <= 1:
+        return [0.0] * n
+
+    redundancy: list[float] = []
+    for i in range(n):
+        max_sim = 0.0
+        for j in range(n):
+            if i == j:
+                continue
+            sim = _jaccard(token_sets[i], token_sets[j])
+            if sim > max_sim:
+                max_sim = sim
+        redundancy.append(max_sim)
+    return redundancy
+
+
+def _fragile_fact_bonus(block: "Block", slot_index: "SlotIndex | None") -> float:
+    """Return 0.1 if block has any slots in the slot_index, else 0.0."""
+    if slot_index is None:
+        return 0.0
+    return 0.1 if slot_index.block_has_slot(block.id) else 0.0
+
+
+def _structure_bonus(content: str) -> float:
+    """Return 0.05 if content has JSON/code/table markers, else 0.0."""
+    for marker in _STRUCTURE_MARKERS:
+        if marker in content:
+            return 0.05
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
 # Public interface
 # ---------------------------------------------------------------------------
 
 class QueryAwareSelector:
     """
-    Scores a list of blocks against the active query using:
-      - BM25 (keyword overlap weighted by IDF)
-      - TF-IDF cosine similarity
-      - Recency weighting
-      - Source priority weighting
+    Scores a list of blocks against the active query using Marginal Information
+    Gain (MMR-style) scoring:
 
-    The combined score drives the budget controller's keep/drop decisions.
+      score(i) = relevance(i) + fragile_fact_bonus(i) + structure_bonus(i)
+               + recency(i) × recency_w + priority(i) × priority_w
+               - mmr_lambda × redundancy(i)
+
+    Where relevance(i) = bm25_w × bm25[i] + tfidf_w × tfidf[i].
     """
 
     def __init__(
@@ -136,12 +189,14 @@ class QueryAwareSelector:
         tfidf_weight: float = 0.30,
         recency_weight: float = 0.10,
         priority_weight: float = 0.10,
+        mmr_lambda: float = 0.3,
     ) -> None:
         total = bm25_weight + tfidf_weight + recency_weight + priority_weight
         self.bm25_w = bm25_weight / total
         self.tfidf_w = tfidf_weight / total
         self.recency_w = recency_weight / total
         self.priority_w = priority_weight / total
+        self.mmr_lambda = mmr_lambda
 
     def score_blocks(
         self,
@@ -150,9 +205,10 @@ class QueryAwareSelector:
         *,
         score_all_types: bool = False,
         task_descriptor: "TaskDescriptor | None" = None,
+        slot_index: "SlotIndex | None" = None,
     ) -> list["Block"]:
         """
-        Attach a relevance score (0–1) to each block.
+        Attach a relevance score (0–1) to each block using MMR-style scoring.
 
         By default only selectable block types are scored;
         others receive score=1.0 to ensure they are preserved.
@@ -161,6 +217,9 @@ class QueryAwareSelector:
         If task_descriptor is provided, the RetentionPolicy weights are applied
         as multipliers on the final score before clamping, biasing the selector
         towards block types that are important for the inferred task.
+
+        If slot_index is provided, blocks containing protected slots receive
+        a fragile_fact_bonus of 0.1.
         """
         if not query.strip():
             # No query — assign neutral scores
@@ -193,6 +252,10 @@ class QueryAwareSelector:
         bm25 = _bm25_scores(query_tokens, doc_token_lists)
         tfidf = _tfidf_cosine(query_tokens, doc_token_lists)
 
+        # Pre-compute token sets for redundancy (Jaccard)
+        token_sets = [set(tl) for tl in doc_token_lists]
+        redundancy = _compute_redundancy(token_sets)
+
         # Build a per-block-type weight multiplier from the retention policy
         policy = task_descriptor.retention_policy if task_descriptor else None
 
@@ -217,11 +280,18 @@ class QueryAwareSelector:
             recency = _recency_score(b.metadata.position, total_blocks)
             priority_norm = b.metadata.priority / 100.0
 
+            # Marginal Information Gain score
+            relevance = self.bm25_w * bm25[rank] + self.tfidf_w * tfidf[rank]
+            ff_bonus = _fragile_fact_bonus(b, slot_index)
+            st_bonus = _structure_bonus(b.content)
+
             combined = (
-                self.bm25_w * bm25[rank]
-                + self.tfidf_w * tfidf[rank]
+                relevance
+                + ff_bonus
+                + st_bonus
                 + self.recency_w * recency
                 + self.priority_w * priority_norm
+                - self.mmr_lambda * redundancy[rank]
             )
             # Apply task-aware retention weight
             combined = combined * _policy_weight(b)

@@ -4,18 +4,23 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-from optimizerllm.budget.controller import BudgetController
+from optimizerllm.budget.controller import BudgetController, BudgetPlannerV2
 from optimizerllm.cache.optimizer import CacheOptimizer
 from optimizerllm.compression.compactor import ConversationCompactor
 from optimizerllm.compression.granular_selector import GranularSelector
 from optimizerllm.compression.planner import CompressionPlanner
 from optimizerllm.compression.selector import QueryAwareSelector
+from optimizerllm.compression.span_critic import SpanCritic
+from optimizerllm.compression.target_predictor import TargetPrediction, TargetPredictor
 from optimizerllm.core.block import Block, BlockType, CompressionMode
 from optimizerllm.core.result import OptimizationResult, RemovalRecord, TelemetryReport
+from optimizerllm.filtering.adaptive import AdaptiveEvidenceFilter
 from optimizerllm.ingestion.ingester import Ingester
 from optimizerllm.normalization.normalizer import Normalizer, TextMinifier
 from optimizerllm.recover.recover import Recover, RecoveryRecord
+from optimizerllm.reranking.reorder import SemanticReorder
 from optimizerllm.rendering.renderer import Renderer
+from optimizerllm.risk_controller.controller import RiskAssessment, RiskController
 from optimizerllm.slot_guard.guard import SlotGuard, SlotIndex
 from optimizerllm.task_synth.synth import TaskDescriptor, TaskSynth
 from optimizerllm.token_accounting.counter import TokenBudget, TokenCounter
@@ -46,21 +51,25 @@ class ContextOptimizer:
         # result.telemetry →  full audit report
         print(result.summary())
 
-    Pipeline order (Phase 1 + 2 + 3):
+    Pipeline order (Phase 1 + 2 + 3 + v2):
       1.  Ingest → flat list of Block objects
       2.  Normalize → whitespace, JSON canonicalization, deduplication
       3.  [conservative/aggressive] Minify prose
       4.  Token count every block (pre-normalization snapshot for telemetry)
       5.  Plan compression strategy per block
+      5a. [optional] RiskController → assess compression risk
       5b. [optional] TaskSynth → infer task type and retention policy
       5c. [optional] SlotGuard → extract and index brittle facts (slots)
-      6.  [conservative/aggressive] Score blocks against query
+      6.  [conservative/aggressive] Score blocks against query (MMR-style)
+      6.5 [optional] SemanticReorder → reorder retrieved docs by marginal gain
       7.  [conservative/aggressive] Filter low-relevance blocks
+      7a. [optional] AdaptiveEvidenceFilter → per-family quota filtering
       8.  [conservative/aggressive] Compact conversation history (slot-aware)
       9.  [Phase 2] Granular trimming → section and sentence level (slot-aware)
       10. Cache-optimize prefix ordering
       11. Budget control → fit blocks into token limit
       11b.[optional] Recover → detect and re-inject lost slots
+      11c. Calibration telemetry
       12. Render to target format
       13. Collect and finalize telemetry
     """
@@ -86,6 +95,14 @@ class ContextOptimizer:
         enable_task_synth: bool = True,
         enable_recover: bool = True,
         recover_max_slots: int = 8,
+        # v2 — new modules
+        enable_risk_controller: bool = True,
+        enable_semantic_reorder: bool = True,
+        enable_adaptive_filter: bool = False,   # off by default (additive, not replacing threshold filter)
+        mmr_lambda: float = 0.3,
+        # Phase 2 — learned micro-selector
+        enable_target_predictor: bool = True,
+        enable_span_critic: bool = True,
     ) -> None:
         """
         Args:
@@ -105,6 +122,12 @@ class ContextOptimizer:
             enable_task_synth: Infer task type to bias retention weights.
             enable_recover: Inject recovery note if critical slots were dropped.
             recover_max_slots: Max number of lost slots to recover.
+            enable_risk_controller: Assess compression risk before applying compression.
+            enable_semantic_reorder: Reorder retrieved docs by marginal information gain.
+            enable_adaptive_filter: Use per-family quota filtering (off by default).
+            mmr_lambda: MMR diversity penalty (0.0 = pure relevance, 1.0 = pure diversity).
+            enable_target_predictor: Phase 2 — task-aware trimming permission predictor.
+            enable_span_critic: Phase 2 — MMR-style redundancy-aware sentence scorer.
         """
         if isinstance(mode, str):
             mode = CompressionMode(mode)
@@ -119,6 +142,11 @@ class ContextOptimizer:
         self.enable_slot_guard = enable_slot_guard
         self.enable_task_synth = enable_task_synth
         self.enable_recover = enable_recover
+        self.enable_risk_controller = enable_risk_controller
+        self.enable_semantic_reorder = enable_semantic_reorder
+        self.enable_adaptive_filter = enable_adaptive_filter
+        self.enable_target_predictor = enable_target_predictor
+        self.enable_span_critic = enable_span_critic
 
         self._budget = TokenBudget(
             max_input_tokens=max_input_tokens,
@@ -131,11 +159,16 @@ class ContextOptimizer:
         self._minifier = TextMinifier()
         self._counter = TokenCounter()
         self._planner = CompressionPlanner(mode=mode)
-        self._selector = QueryAwareSelector()
+        self._selector = QueryAwareSelector(mmr_lambda=mmr_lambda)
         self._granular = GranularSelector(
             section_threshold=section_threshold,
             sentence_threshold=sentence_threshold,
         )
+        # Phase 2 modules
+        self._target_predictor = TargetPredictor()
+        self._span_critic = SpanCritic()
+        if enable_span_critic:
+            self._granular.set_span_critic(self._span_critic)
         self._compactor = ConversationCompactor(recency_tail=compactor_recency_tail)
         self._cache_opt = CacheOptimizer(provider=provider)
         self._budget_ctrl = BudgetController(
@@ -147,6 +180,10 @@ class ContextOptimizer:
         self._task_synth = TaskSynth()
         self._slot_guard = SlotGuard()
         self._recover = Recover(max_slots=recover_max_slots)
+        # v2 modules
+        self._risk_ctrl = RiskController()
+        self._reranker = SemanticReorder(mmr_lambda=mmr_lambda)
+        self._adaptive_filter = AdaptiveEvidenceFilter()
 
     def optimize(
         self,
@@ -246,6 +283,10 @@ class ContextOptimizer:
             task_descriptor = self._task_synth.synthesize(blocks, query=active_query)
             telemetry.extra["task_type"] = task_descriptor.task_type.value
             telemetry.extra["task_confidence"] = round(task_descriptor.confidence, 3)
+            # v2: failure mode and noise profile
+            telemetry.extra["primary_failure_mode"] = task_descriptor.primary_failure_mode
+            telemetry.extra["retrieval_noise_profile"] = task_descriptor.retrieval_noise_profile
+            telemetry.extra["reasoning_dependency_density"] = task_descriptor.reasoning_dependency_density
 
         # ------------------------------------------------------------------
         # Step 5c: SlotGuard — extract brittle facts from all blocks
@@ -256,6 +297,34 @@ class ContextOptimizer:
             telemetry.extra["slots_extracted"] = len(slot_index)
 
         # ------------------------------------------------------------------
+        # Step 5a: RiskController — assess compression risk
+        # ------------------------------------------------------------------
+        risk_assessment: RiskAssessment | None = None
+        if self.enable_risk_controller:
+            risk_assessment = self._risk_ctrl.assess(blocks, task_descriptor=task_descriptor)
+            telemetry.extra["risk_level"] = risk_assessment.risk_level
+            telemetry.extra["reasoning_fragility"] = round(risk_assessment.reasoning_fragility, 3)
+            telemetry.extra["schema_sensitivity"] = round(risk_assessment.schema_sensitivity, 3)
+            telemetry.extra["target_compression_band"] = risk_assessment.target_compression_band
+
+        # ------------------------------------------------------------------
+        # Step 5d: TargetPredictor — task-aware trimming permissions (Phase 2)
+        # ------------------------------------------------------------------
+        target_prediction: TargetPrediction | None = None
+        if self.enable_target_predictor:
+            target_prediction = self._target_predictor.predict(
+                blocks,
+                risk_assessment=risk_assessment,
+                task_descriptor=task_descriptor,
+            )
+            telemetry.extra["target_prediction_band"] = target_prediction.compression_band
+            telemetry.extra["allow_sentence_trim"] = target_prediction.allow_sentence_trim
+            telemetry.extra["allow_section_trim"] = target_prediction.allow_section_trim
+            telemetry.extra["allow_span_trim"] = target_prediction.allow_span_trim
+            if target_prediction.rationale:
+                telemetry.extra["target_predictor_rationale"] = target_prediction.rationale
+
+        # ------------------------------------------------------------------
         # Step 6 & 7: Query-aware scoring and filtering (conservative+)
         # ------------------------------------------------------------------
         if self.mode in (CompressionMode.CONSERVATIVE, CompressionMode.AGGRESSIVE):
@@ -264,12 +333,26 @@ class ContextOptimizer:
                     blocks,
                     active_query,
                     task_descriptor=task_descriptor,
+                    slot_index=slot_index,
                 )
+
+                # Step 6.5: Semantic reordering of retrieved docs by marginal gain
+                if self.enable_semantic_reorder:
+                    blocks = self._reranker.reorder(blocks, active_query)
+
                 kept, removed_sel = self._selector.filter_by_threshold(
                     blocks, threshold=self.selector_threshold
                 )
                 all_removed.extend(removed_sel)
                 blocks = kept
+
+                # Step 7 (adaptive): AdaptiveEvidenceFilter (optional, additive)
+                if self.enable_adaptive_filter:
+                    kept_adaptive, removed_adaptive = self._adaptive_filter.filter(
+                        blocks, task_descriptor=task_descriptor
+                    )
+                    all_removed.extend(removed_adaptive)
+                    blocks = kept_adaptive
 
         # ------------------------------------------------------------------
         # Step 8: Conversation compaction (conservative+, slot-aware)
@@ -294,11 +377,40 @@ class ContextOptimizer:
         # ------------------------------------------------------------------
         if self.mode in (CompressionMode.CONSERVATIVE, CompressionMode.AGGRESSIVE):
             if active_query and (self.section_level or self.sentence_level):
+                # Phase 2: TargetPredictor provides task-aware trimming permissions.
+                # Fall back to legacy RiskController flags when predictor is disabled.
+                if target_prediction is not None:
+                    safe_sentence_level = (
+                        self.sentence_level and target_prediction.allow_sentence_trim
+                    )
+                    safe_section_level = (
+                        self.section_level and target_prediction.allow_section_trim
+                    )
+                    safe_span_level: bool | None = (
+                        target_prediction.allow_span_trim or None
+                    )
+                    if not safe_sentence_level or not safe_section_level:
+                        telemetry.extra["reasoning_safe_mode"] = True
+                else:
+                    # Legacy fallback (RiskController only)
+                    safe_sentence_level = self.sentence_level
+                    safe_section_level = self.section_level
+                    safe_span_level = None
+                    if (
+                        risk_assessment is not None
+                        and risk_assessment.skip_sentence_trimming
+                    ):
+                        safe_sentence_level = False
+                        if risk_assessment.reasoning_fragility >= 0.6:
+                            safe_section_level = False
+                        telemetry.extra["reasoning_safe_mode"] = True
+
                 blocks = self._granular.trim_blocks(
                     blocks,
                     active_query,
-                    section_level=self.section_level,
-                    sentence_level=self.sentence_level,
+                    section_level=safe_section_level,
+                    sentence_level=safe_sentence_level,
+                    span_level=safe_span_level,
                     slot_index=slot_index,
                 )
                 # Re-count tokens after granular trimming (content may have shrunk)
@@ -338,6 +450,15 @@ class ContextOptimizer:
         if self.enable_recover and slot_index is not None and len(slot_index) > 0:
             final_blocks, recovery_records = self._recover.run(final_blocks, slot_index)
             telemetry.extra["slots_recovered"] = len(recovery_records)
+
+        # ------------------------------------------------------------------
+        # Step 11c: Calibration telemetry (v2)
+        # ------------------------------------------------------------------
+        if self.enable_slot_guard and slot_index is not None:
+            telemetry.fact_loss_count = len(slot_index.audit(final_blocks))
+        telemetry.schema_core_preserved = not any(
+            r.block_type in ("tool_schema", "system_prompt") for r in telemetry.blocks_removed
+        )
 
         # ------------------------------------------------------------------
         # Step 12: Render

@@ -54,6 +54,10 @@ from optimizerllm.optimizer import ContextOptimizer
 from optimizerllm.slot_guard.guard import Slot, SlotGuard, SlotIndex, SlotType
 from optimizerllm.task_synth.synth import TaskDescriptor, TaskSynth, TaskType
 from optimizerllm.recover.recover import Recover, RecoveryRecord
+from optimizerllm.risk_controller.controller import RiskController, RiskAssessment
+from optimizerllm.reranking.reorder import SemanticReorder
+from optimizerllm.filtering.adaptive import AdaptiveEvidenceFilter
+from optimizerllm.budget.controller import BudgetController, BudgetPlannerV2
 
 __all__ = [
     # Main API
@@ -94,6 +98,16 @@ __all__ = [
     # Recovery
     "Recover",
     "RecoveryRecord",
+    # v2: Risk Controller
+    "RiskController",
+    "RiskAssessment",
+    # v2: Semantic Reorder
+    "SemanticReorder",
+    # v2: Adaptive Evidence Filter
+    "AdaptiveEvidenceFilter",
+    # v2: Budget Planner
+    "BudgetController",
+    "BudgetPlannerV2",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
