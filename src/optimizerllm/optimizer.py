@@ -398,16 +398,12 @@ class ContextOptimizer:
                     safe_section_level = (
                         self.section_level and target_prediction.allow_section_trim
                     )
-                    safe_span_level: bool | None = (
-                        target_prediction.allow_span_trim or None
-                    )
                     if not safe_sentence_level or not safe_section_level:
                         telemetry.extra["reasoning_safe_mode"] = True
                 else:
                     # Legacy fallback (RiskController only)
                     safe_sentence_level = self.sentence_level
                     safe_section_level = self.section_level
-                    safe_span_level = None
                     if (
                         risk_assessment is not None
                         and risk_assessment.skip_sentence_trimming
@@ -422,10 +418,14 @@ class ContextOptimizer:
                     active_query,
                     section_level=safe_section_level,
                     sentence_level=safe_sentence_level,
-                    span_level=safe_span_level,
                     slot_index=slot_index,
                     sentence_keep_fraction=(
                         target_prediction.sentence_keep_fraction
+                        if target_prediction is not None
+                        else None
+                    ),
+                    token_keep_fraction=(
+                        target_prediction.token_keep_fraction
                         if target_prediction is not None
                         else None
                     ),

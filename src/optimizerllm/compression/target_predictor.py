@@ -79,11 +79,18 @@ class TargetPrediction:
     # Higher = this block is more redundant given the other evidence blocks.
     block_redundancy: dict[str, float] = field(default_factory=dict)
 
-    # Budget-driven sentence selection: keep at most this fraction of sentences
-    # per block (e.g. 0.60 = keep top-60% by SpanCritic score).
-    # None = use threshold-based selection (current behaviour, unchanged).
-    # Only set for safe-trim tasks where aggressive trimming is known-safe.
+    # Sentence-level budget fraction: SpanCritic budget mode keeps top
+    # ceil(n × frac) sentences per block.
+    # None = threshold mode (keep every sentence above sentence_threshold).
+    # Phase 2C values: 0.55 (summarization/rag), 0.62 (extraction), 0.70 (tool_use)
     sentence_keep_fraction: float | None = None
+
+    # Token-level keep fraction: within each surviving sentence, keep this
+    # fraction of tokens (e.g. 0.55 = keep 55% of tokens per sentence).
+    # Force-keep sentences (fragility >= 0.45, slot sentences) always retain
+    # all their tokens regardless of this value.
+    # None = skip token-level trimming entirely (conservative / lossless).
+    token_keep_fraction: float | None = None
 
     # Human-readable log of which signals fired
     rationale: list[str] = field(default_factory=list)
@@ -204,28 +211,65 @@ class TargetPredictor:
             rationale.append(f"{task_type}:custom_family_budgets")
 
         # ------------------------------------------------------------------
-        # 6. Budget-driven sentence keep fraction
-        #    Only for safe-trim tasks where sentence trimming is allowed.
-        #    Scales with evidence redundancy: more redundant → more aggressive.
+        # 6. Sentence-level budget fraction (Phase 2C restored)
+        #    Controls what fraction of sentences to keep per block in budget mode.
+        #    Only activates for blocks >= _MIN_CHARS_FOR_BUDGET_MODE (3000 chars).
+        #    This is the workhorse stage that gave 0.792 on meetingbank.
+        #
+        #    Per-task calibration:
+        #      summarization/rag  → 0.55  (aggressive: dense retrieved content)
+        #      extraction         → 0.62  (moderate: need more facts preserved)
+        #      tool_use           → 0.70  (conservative: tools need their schemas)
+        #      math/code low frag → 0.75  (light pruning only — reasoning chains)
+        #      general/chat       → None  (threshold mode, no budget pressure)
         # ------------------------------------------------------------------
         sentence_keep_fraction: float | None = None
+        if allow_sentence_trim:
+            if task_type in ("summarization", "rag"):
+                sentence_keep_fraction = 0.55
+                rationale.append(f"sentence_budget:0.55:{task_type}")
+            elif task_type == "extraction":
+                sentence_keep_fraction = 0.62
+                rationale.append("sentence_budget:0.62:extraction")
+            elif task_type == "tool_use":
+                sentence_keep_fraction = 0.70
+                rationale.append("sentence_budget:0.70:tool_use")
+            elif task_type in ("math", "code") and reasoning_fragility < 0.30:
+                sentence_keep_fraction = 0.75
+                rationale.append(
+                    f"sentence_budget:0.75:{task_type}:low_fragility"
+                )
+            # classification, general, chat → None (threshold mode)
+
+        # ------------------------------------------------------------------
+        # 7. Token-level keep fraction
+        #    Runs AFTER sentence-level. Combined math:
+        #      sentence_stage × token_stage ≈ total compression.
+        #      meetingbank: 0.792 × 0.55 ≈ 0.436 (beats LLMLingua2's 0.403)
+        #    Only for safe-trim tasks where sentence trimming is allowed.
+        #    Force-keep sentences (fragility >= 0.45, slots) always keep 100%.
+        #    Scales with evidence redundancy: more redundant → more aggressive.
+        #
+        #    Calibrated for token level (finer granularity than sentence level):
+        #      high redundancy  → 0.50  (drop 50% of tokens per sentence)
+        #      moderate         → 0.55
+        #      low redundancy   → 0.60  (drop 40% of tokens per sentence)
+        # ------------------------------------------------------------------
+        token_keep_fraction: float | None = None
         if allow_sentence_trim and task_type in _SAFE_TRIM_TASKS:
             if avg_redundancy > 0.30:
-                # Multi-doc with high overlap: aggressively drop redundant content
-                sentence_keep_fraction = 0.55
+                token_keep_fraction = 0.50
                 rationale.append(
-                    f"sentence_budget:0.55:high_redundancy:{avg_redundancy:.2f}"
+                    f"token_budget:0.50:high_redundancy:{avg_redundancy:.2f}"
                 )
             elif avg_redundancy > 0.10:
-                # Moderate inter-doc redundancy: medium budget
-                sentence_keep_fraction = 0.62
+                token_keep_fraction = 0.55
                 rationale.append(
-                    f"sentence_budget:0.62:moderate_redundancy:{avg_redundancy:.2f}"
+                    f"token_budget:0.55:moderate_redundancy:{avg_redundancy:.2f}"
                 )
             else:
-                # Single-doc or low-overlap multi-doc: conservative budget
-                sentence_keep_fraction = 0.70
-                rationale.append(f"sentence_budget:0.70:{task_type}:low_redundancy")
+                token_keep_fraction = 0.60
+                rationale.append(f"token_budget:0.60:{task_type}:low_redundancy")
 
         return TargetPrediction(
             compression_band=(round(min_rate, 3), round(max_rate, 3)),
@@ -236,6 +280,7 @@ class TargetPredictor:
             per_family_budgets=per_family_budgets,
             block_redundancy=block_redundancy,
             sentence_keep_fraction=sentence_keep_fraction,
+            token_keep_fraction=token_keep_fraction,
             rationale=rationale,
         )
 
