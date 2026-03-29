@@ -340,8 +340,20 @@ class ContextOptimizer:
                 if self.enable_semantic_reorder:
                     blocks = self._reranker.reorder(blocks, active_query)
 
+                # Lever 3: tighten block threshold when many evidence blocks present.
+                # With ≥4 retrieved docs, raise the minimum score so low-relevance
+                # noise documents are dropped entire rather than sentence-trimmed.
+                n_evidence = sum(
+                    1 for b in blocks if b.block_type == BlockType.RETRIEVED_DOC
+                )
+                effective_threshold = (
+                    max(self.selector_threshold, 0.25)
+                    if n_evidence >= 4
+                    else self.selector_threshold
+                )
+
                 kept, removed_sel = self._selector.filter_by_threshold(
-                    blocks, threshold=self.selector_threshold
+                    blocks, threshold=effective_threshold
                 )
                 all_removed.extend(removed_sel)
                 blocks = kept
@@ -412,6 +424,11 @@ class ContextOptimizer:
                     sentence_level=safe_sentence_level,
                     span_level=safe_span_level,
                     slot_index=slot_index,
+                    sentence_keep_fraction=(
+                        target_prediction.sentence_keep_fraction
+                        if target_prediction is not None
+                        else None
+                    ),
                 )
                 # Re-count tokens after granular trimming (content may have shrunk)
                 blocks = self._counter.count_blocks(blocks, provider=self.provider, model=self.model)

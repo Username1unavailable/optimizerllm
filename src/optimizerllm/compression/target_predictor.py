@@ -79,6 +79,12 @@ class TargetPrediction:
     # Higher = this block is more redundant given the other evidence blocks.
     block_redundancy: dict[str, float] = field(default_factory=dict)
 
+    # Budget-driven sentence selection: keep at most this fraction of sentences
+    # per block (e.g. 0.60 = keep top-60% by SpanCritic score).
+    # None = use threshold-based selection (current behaviour, unchanged).
+    # Only set for safe-trim tasks where aggressive trimming is known-safe.
+    sentence_keep_fraction: float | None = None
+
     # Human-readable log of which signals fired
     rationale: list[str] = field(default_factory=list)
 
@@ -197,6 +203,30 @@ class TargetPredictor:
         if per_family_budgets:
             rationale.append(f"{task_type}:custom_family_budgets")
 
+        # ------------------------------------------------------------------
+        # 6. Budget-driven sentence keep fraction
+        #    Only for safe-trim tasks where sentence trimming is allowed.
+        #    Scales with evidence redundancy: more redundant → more aggressive.
+        # ------------------------------------------------------------------
+        sentence_keep_fraction: float | None = None
+        if allow_sentence_trim and task_type in _SAFE_TRIM_TASKS:
+            if avg_redundancy > 0.30:
+                # Multi-doc with high overlap: aggressively drop redundant content
+                sentence_keep_fraction = 0.55
+                rationale.append(
+                    f"sentence_budget:0.55:high_redundancy:{avg_redundancy:.2f}"
+                )
+            elif avg_redundancy > 0.10:
+                # Moderate inter-doc redundancy: medium budget
+                sentence_keep_fraction = 0.62
+                rationale.append(
+                    f"sentence_budget:0.62:moderate_redundancy:{avg_redundancy:.2f}"
+                )
+            else:
+                # Single-doc or low-overlap multi-doc: conservative budget
+                sentence_keep_fraction = 0.70
+                rationale.append(f"sentence_budget:0.70:{task_type}:low_redundancy")
+
         return TargetPrediction(
             compression_band=(round(min_rate, 3), round(max_rate, 3)),
             allow_section_trim=allow_section_trim,
@@ -205,6 +235,7 @@ class TargetPredictor:
             aggressive_families=aggressive_families,
             per_family_budgets=per_family_budgets,
             block_redundancy=block_redundancy,
+            sentence_keep_fraction=sentence_keep_fraction,
             rationale=rationale,
         )
 

@@ -184,6 +184,7 @@ class GranularSelector:
         sentence_level: bool = True,
         span_level: bool | None = None,
         slot_index: "SlotIndex | None" = None,
+        sentence_keep_fraction: float | None = None,
     ) -> list["Block"]:
         """
         Apply granular trimming to all eligible blocks.
@@ -191,6 +192,11 @@ class GranularSelector:
         Args:
             span_level: If provided, overrides self.span_level for this call.
                         None → use self.span_level (the instance default).
+            sentence_keep_fraction: When set (0.0–1.0), switch sentence selection
+                from threshold-based to budget-based: keep the top
+                ceil(n * sentence_keep_fraction) sentences ranked by SpanCritic
+                net_keep_score. Force-keep sentences (fragility_prob >= 0.45) are
+                always included outside the budget. None = threshold mode (default).
 
         Returns new block objects (originals untouched).
         """
@@ -220,7 +226,8 @@ class GranularSelector:
             if sentence_level and len(trimmed_content) >= _MIN_CHARS_FOR_SENTENCE_SPLIT:
                 if self._span_critic is not None:
                     trimmed_content = self._trim_sentences_with_critic(
-                        trimmed_content, query_tokens, slot_index=slot_index
+                        trimmed_content, query_tokens, slot_index=slot_index,
+                        keep_fraction=sentence_keep_fraction,
                     )
                 else:
                     trimmed_content = self._trim_sentences(
@@ -385,17 +392,25 @@ class GranularSelector:
         text: str,
         query_tokens: list[str],
         slot_index: "SlotIndex | None" = None,
+        keep_fraction: float | None = None,
     ) -> str:
         """
         MMR-style sentence selection using SpanCritic.
 
-        Algorithm:
+        Two modes depending on keep_fraction:
+
+        Threshold mode (keep_fraction=None, default):
           1. Score all sentences via SpanCritic (initial scores, redundancy=0)
           2. Seed keep_set with the highest keep_prob sentence
-          3. Iterate remaining sentences in order; update redundancy against
-             already-selected, then keep if net_keep_score >= threshold OR
-             fragility_prob >= 0.60 OR sentence contains a slot
+          3. Keep if net_keep_score >= threshold OR force_keep OR slot sentence
           4. Enforce minimum, add context buffer, reconstruct
+
+        Budget mode (keep_fraction set):
+          1. Score all sentences
+          2. Force-keep: fragility_prob >= 0.45 OR slot sentences (always kept)
+          3. Fill remaining budget = ceil(n * keep_fraction) - n_forced
+             from highest net_keep_score downward
+          4. Enforce minimum, reconstruct (no context buffer — budget is the budget)
         """
         assert self._span_critic is not None
 
@@ -406,52 +421,104 @@ class GranularSelector:
         n = len(sentences)
         texts = [s.text for s in sentences]
 
-        # Step 1: initial scores
+        # Step 1: score all sentences
         scores = self._span_critic.score_batch(
             texts, query_tokens, slot_index=slot_index
         )
 
-        # Step 2: seed with highest keep_prob sentence
-        max_idx = max(range(n), key=lambda i: scores[i].keep_prob)
-        keep_set: set[int] = {max_idx}
-        selected_texts: list[str] = [texts[max_idx]]
+        # Only use budget mode for genuinely long blocks. Short documents
+        # (< 3000 chars) have few sentences so dropping even one can remove
+        # critical factual content that isn't lexically close to the query.
+        _MIN_CHARS_FOR_BUDGET_MODE = 3000
+        effective_keep_fraction = (
+            keep_fraction if (keep_fraction is not None and len(text) >= _MIN_CHARS_FOR_BUDGET_MODE)
+            else None
+        )
 
-        # Step 3: greedy MMR selection over remaining sentences
-        updated_scores: list = list(scores)  # will hold updated redundancy
-        for i in range(n):
-            if i in keep_set:
-                continue
-            updated = self._span_critic.update_redundancy(
-                scores[i], texts[i], selected_texts
-            )
-            updated_scores[i] = updated
-            is_slot_sentence = (
-                slot_index is not None and slot_index.sentence_has_slot(texts[i])
-            )
-            should_keep = (
-                updated.net_keep_score >= self.sentence_threshold
-                or updated.should_force_keep
-                or is_slot_sentence
-            )
-            if should_keep:
-                keep_set.add(i)
-                selected_texts.append(texts[i])
+        if effective_keep_fraction is not None:
+            keep_fraction = effective_keep_fraction  # use local alias below
+            # ── Budget mode ────────────────────────────────────────────────
+            import math as _math
 
-        # Step 4: enforce minimum
-        if len(keep_set) < self.min_sentences:
-            ranked = sorted(range(n), key=lambda i: scores[i].keep_prob, reverse=True)
-            for idx in ranked:
-                keep_set.add(idx)
-                if len(keep_set) >= self.min_sentences:
-                    break
+            # Compute full redundancy for all sentences against the best-scoring one
+            max_idx = max(range(n), key=lambda i: scores[i].keep_prob)
+            selected_texts: list[str] = [texts[max_idx]]
+            updated_scores: list = list(scores)
+            for i in range(n):
+                if i == max_idx:
+                    continue
+                updated_scores[i] = self._span_critic.update_redundancy(
+                    scores[i], texts[i], selected_texts
+                )
 
-        # Add context buffer
-        buffered: set[int] = set()
-        for idx in keep_set:
-            for offset in range(-self.context_buffer, self.context_buffer + 1):
-                neighbour = idx + offset
-                if 0 <= neighbour < n:
-                    buffered.add(neighbour)
+            # Forced-keep set: fragility >= 0.45 or slot sentence
+            forced: set[int] = set()
+            for i in range(n):
+                is_slot = slot_index is not None and slot_index.sentence_has_slot(texts[i])
+                if updated_scores[i].should_force_keep or is_slot:
+                    forced.add(i)
+
+            # Budget: at most ceil(n * keep_fraction) total, but at least min_sentences
+            budget = max(
+                self.min_sentences,
+                _math.ceil(n * keep_fraction),
+            )
+
+            # Fill budget with highest net_keep_score non-forced sentences
+            non_forced_ranked = sorted(
+                [i for i in range(n) if i not in forced],
+                key=lambda i: updated_scores[i].net_keep_score,
+                reverse=True,
+            )
+            remaining = max(0, budget - len(forced))
+            selected_non_forced = set(non_forced_ranked[:remaining])
+
+            keep_set = forced | selected_non_forced
+            buffered = keep_set  # no context buffer in budget mode
+
+        else:
+            # ── Threshold mode (original) ──────────────────────────────────
+            # Step 2: seed with highest keep_prob sentence
+            max_idx = max(range(n), key=lambda i: scores[i].keep_prob)
+            keep_set = {max_idx}
+            selected_texts = [texts[max_idx]]
+
+            # Step 3: greedy MMR selection over remaining sentences
+            updated_scores = list(scores)  # will hold updated redundancy
+            for i in range(n):
+                if i in keep_set:
+                    continue
+                updated = self._span_critic.update_redundancy(
+                    scores[i], texts[i], selected_texts
+                )
+                updated_scores[i] = updated
+                is_slot_sentence = (
+                    slot_index is not None and slot_index.sentence_has_slot(texts[i])
+                )
+                should_keep = (
+                    updated.net_keep_score >= self.sentence_threshold
+                    or updated.should_force_keep
+                    or is_slot_sentence
+                )
+                if should_keep:
+                    keep_set.add(i)
+                    selected_texts.append(texts[i])
+
+            # Step 4: enforce minimum
+            if len(keep_set) < self.min_sentences:
+                ranked = sorted(range(n), key=lambda i: scores[i].keep_prob, reverse=True)
+                for idx in ranked:
+                    keep_set.add(idx)
+                    if len(keep_set) >= self.min_sentences:
+                        break
+
+            # Add context buffer (threshold mode only)
+            buffered: set[int] = set()
+            for idx in keep_set:
+                for offset in range(-self.context_buffer, self.context_buffer + 1):
+                    neighbour = idx + offset
+                    if 0 <= neighbour < n:
+                        buffered.add(neighbour)
 
         # Emit to capture buffer (training data collection).
         # Done AFTER buffer expansion so `kept` reflects the true final output.
