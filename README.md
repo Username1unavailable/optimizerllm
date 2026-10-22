@@ -64,6 +64,31 @@ Results below come from `optimizerllm-eval` (103/103 tests passing, judge `gpt-4
 | Input cost change | **−19.1%** | baseline | — | |
 | Slot recovery | **3 slots** | 0 | 0 | only method with recovery |
 
+
+## Performance at a glance
+
+### Token reduction
+
+```mermaid
+xychart-beta
+    title "Average token reduction by benchmark"
+    x-axis [GSM8K, MMLU, HumanEval, TruthfulQA, RAG, Chat]
+    y-axis "Reduction (%)" 0 --> 50
+    bar [39.9, 40.8, 24.6, 37.9, 14.3, 31.5]
+```
+
+### Quality and compression
+
+```mermaid
+xychart-beta
+    title "SOTA comparison: optimizerllm vs passthrough"
+    x-axis [Answer quality, Compression ratio, Entity retention, Numeric retention]
+    y-axis "Score" 0 --> 1
+    bar [0.885, 0.840, 0.990, 0.989]
+```
+
+> GitHub renders Mermaid charts automatically. The benchmark values above match the evaluation results documented in this README.
+
 ## Per-benchmark highlights
 
 - **GSM8K math:** 10/10 passing, 39.9% avg reduction. In the SOTA comparison optimizerllm quality (0.895) was **above** passthrough (0.880).
@@ -143,6 +168,15 @@ Recent work adds MMR-style selection via `MarginalGainSelector`, `SemanticReorde
 - **BBH / constraint-heavy reasoning:** aggressive compaction can drop constraint sentences. Use `CONSERVATIVE` mode with `sentence_threshold ≤ 0.15` for these tasks.
 - **Chat compaction:** early numbers or verbatim quotes may not survive. Use `LOSSLESS` when exact phrasing matters.
 - **Noisy queries:** when the query overlaps heavily with noise, CONSERVATIVE mode may produce ~0% reduction because the relevance signal is weak.
+
+## Before publishing
+
+I found no API keys, passwords, private keys, or personal email addresses. However, the repository currently tracks local development artifacts that should **not** be published:
+
+- `.claude/settings.local.json` — contains local absolute paths and saved command permissions.
+- `__pycache__/` folders and `.pyc` files — generated machine-specific Python bytecode.
+
+A `.gitignore` is included for future files, but already tracked files must be removed from Git before publishing. Run `git rm -r --cached .claude/settings.local.json src/**/__pycache__ tests/__pycache__` and commit that cleanup. Do not commit API keys or `.env` files.
 
 ## License
 
