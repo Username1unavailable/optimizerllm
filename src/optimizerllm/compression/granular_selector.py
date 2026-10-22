@@ -55,7 +55,12 @@ _MIN_CHARS_FOR_SECTION_SPLIT  = 300   # minimum block size for section splitting
 _MIN_CHARS_FOR_SENTENCE_SPLIT = 350   # minimum block size for sentence-level trimming
 _MIN_CHARS_FOR_TOKEN_TRIM     = 350   # minimum block size for token-level trimming
 _MIN_SENT_CHARS_FOR_TOKEN_TRIM = 25   # minimum sentence size to bother compressing
-_MIN_CHARS_FOR_BUDGET_MODE    = 3000  # minimum block size for sentence budget mode
+_MIN_CHARS_FOR_BUDGET_MODE    = 1500  # minimum block size for sentence budget mode (lowered from 3000)
+
+# Ideal sentence length (tokens) for length-normalized token compression.
+# Sentences longer than this have diluted information density and get
+# more aggressive compression; sentences shorter are left at base fraction.
+_TARGET_SENT_LEN = 12
 
 _ELLIPSIS = "[…]"
 
@@ -533,12 +538,25 @@ class GranularSelector:
                 result.append(sent_text)
                 continue
 
-            # Modulate fraction by sentence importance
+            # Multiplicative importance weighting: low-importance sentences get
+            # far more aggressive compression than high-importance ones.
+            # Scale = 0.20 + 1.60 × keep_prob, giving range [0.20×base, 1.80×base].
+            # This is 9× more dynamic than the old ±0.20 additive swing and
+            # lets us pool tokens toward sentences that actually matter.
             if critic_scores is not None:
-                adj      = (critic_scores[i].keep_prob - 0.5) * 0.40
-                per_frac = max(0.30, min(1.0, token_keep_fraction + adj))
+                importance = critic_scores[i].keep_prob           # 0.0–1.0
+                scale      = 0.20 + 1.60 * importance             # 0.20–1.80
+                per_frac   = max(0.25, min(1.0, token_keep_fraction * scale))
             else:
                 per_frac = max(0.30, token_keep_fraction)
+
+            # Length-normalized compression: long sentences have diluted information
+            # density and absorb more aggressive compression without quality loss.
+            # sqrt(target/actual) is a gentle sub-linear penalty.
+            sent_toks = len(_TOKEN_RE.findall(sent_text))
+            if sent_toks > _TARGET_SENT_LEN:
+                length_scale = math.sqrt(_TARGET_SENT_LEN / sent_toks)
+                per_frac     = max(0.25, per_frac * length_scale)
 
             result.append(
                 _compress_sentence_tokens(sent_text, query_token_set, idf, per_frac)

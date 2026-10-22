@@ -211,65 +211,82 @@ class TargetPredictor:
             rationale.append(f"{task_type}:custom_family_budgets")
 
         # ------------------------------------------------------------------
-        # 6. Sentence-level budget fraction (Phase 2C restored)
+        # 6. Sentence-level budget fraction
         #    Controls what fraction of sentences to keep per block in budget mode.
-        #    Only activates for blocks >= _MIN_CHARS_FOR_BUDGET_MODE (3000 chars).
-        #    This is the workhorse stage that gave 0.792 on meetingbank.
-        #
-        #    Per-task calibration:
-        #      summarization/rag  → 0.55  (aggressive: dense retrieved content)
-        #      extraction         → 0.62  (moderate: need more facts preserved)
-        #      tool_use           → 0.70  (conservative: tools need their schemas)
-        #      math/code low frag → 0.75  (light pruning only — reasoning chains)
-        #      general/chat       → None  (threshold mode, no budget pressure)
+        #    Now always active for safe tasks (fragility gate removed).
+        #    Fragility SCALES the fraction rather than disabling it entirely:
+        #      low frag  (<0.40): aggressive — meeting transcripts are safe to trim
+        #      mod frag  (0.40–0.60): moderate — some reasoning present
+        #      high frag (>=0.60): conservative — dense logical connectors
         # ------------------------------------------------------------------
         sentence_keep_fraction: float | None = None
         if allow_sentence_trim:
             if task_type in ("summarization", "rag"):
-                sentence_keep_fraction = 0.55
-                rationale.append(f"sentence_budget:0.55:{task_type}")
+                if reasoning_fragility < 0.40:
+                    sentence_keep_fraction = 0.35
+                    rationale.append(f"sentence_budget:0.35:{task_type}:low_frag")
+                elif reasoning_fragility < 0.60:
+                    sentence_keep_fraction = 0.48
+                    rationale.append(f"sentence_budget:0.48:{task_type}:mod_frag")
+                else:
+                    sentence_keep_fraction = 0.62
+                    rationale.append(f"sentence_budget:0.62:{task_type}:high_frag")
             elif task_type == "extraction":
-                sentence_keep_fraction = 0.62
-                rationale.append("sentence_budget:0.62:extraction")
+                sentence_keep_fraction = 0.42 if reasoning_fragility < 0.40 else 0.58
+                rationale.append(f"sentence_budget:{sentence_keep_fraction:.2f}:extraction")
             elif task_type == "tool_use":
-                sentence_keep_fraction = 0.70
-                rationale.append("sentence_budget:0.70:tool_use")
+                sentence_keep_fraction = 0.55
+                rationale.append("sentence_budget:0.55:tool_use")
             elif task_type in ("math", "code") and reasoning_fragility < 0.30:
                 sentence_keep_fraction = 0.75
-                rationale.append(
-                    f"sentence_budget:0.75:{task_type}:low_fragility"
-                )
+                rationale.append(f"sentence_budget:0.75:{task_type}:low_fragility")
             # classification, general, chat → None (threshold mode)
 
         # ------------------------------------------------------------------
         # 7. Token-level keep fraction
         #    Runs AFTER sentence-level. Combined math:
-        #      sentence_stage × token_stage ≈ total compression.
-        #      meetingbank: 0.792 × 0.55 ≈ 0.436 (beats LLMLingua2's 0.403)
-        #    Only for safe-trim tasks where sentence trimming is allowed.
-        #    Force-keep sentences (fragility >= 0.45, slots) always keep 100%.
-        #    Scales with evidence redundancy: more redundant → more aggressive.
+        #      sentence_stage × token_stage ≈ total compression floor.
+        #    Now uses multiplicative sentence-importance weighting in
+        #    GranularSelector._trim_tokens (low-importance sentences can go
+        #    as low as base × 0.20, high-importance up to base × 1.80).
+        #    Also active for tool_use and math/code at low fragility.
         #
-        #    Calibrated for token level (finer granularity than sentence level):
-        #      high redundancy  → 0.50  (drop 50% of tokens per sentence)
-        #      moderate         → 0.55
-        #      low redundancy   → 0.60  (drop 40% of tokens per sentence)
+        #    Base fractions (scaled up by fragility for safe tasks):
+        #      low redundancy    → 0.50  (base)
+        #      moderate          → 0.45
+        #      high redundancy   → 0.40
+        #    Fragility scale-up (prevents over-trimming connector-dense docs):
+        #      frag >= 0.60      → +0.15 to base
+        #      frag 0.40–0.60    → +0.08 to base
         # ------------------------------------------------------------------
         token_keep_fraction: float | None = None
         if allow_sentence_trim and task_type in _SAFE_TRIM_TASKS:
+            # Base token fraction from redundancy
             if avg_redundancy > 0.30:
-                token_keep_fraction = 0.50
-                rationale.append(
-                    f"token_budget:0.50:high_redundancy:{avg_redundancy:.2f}"
-                )
+                base_tok = 0.40
+                rationale.append(f"token_budget:0.40:high_redundancy:{avg_redundancy:.2f}")
             elif avg_redundancy > 0.10:
-                token_keep_fraction = 0.55
-                rationale.append(
-                    f"token_budget:0.55:moderate_redundancy:{avg_redundancy:.2f}"
-                )
+                base_tok = 0.45
+                rationale.append(f"token_budget:0.45:moderate_redundancy:{avg_redundancy:.2f}")
             else:
-                token_keep_fraction = 0.60
-                rationale.append(f"token_budget:0.60:{task_type}:low_redundancy")
+                base_tok = 0.50
+                rationale.append(f"token_budget:0.50:{task_type}:low_redundancy")
+            # Scale up conservatively if fragility is high
+            if reasoning_fragility >= 0.60:
+                base_tok = min(0.75, base_tok + 0.15)
+                rationale.append(f"token_budget:frag_scale_up_0.15:{base_tok:.2f}")
+            elif reasoning_fragility >= 0.40:
+                base_tok = min(0.65, base_tok + 0.08)
+                rationale.append(f"token_budget:frag_scale_up_0.08:{base_tok:.2f}")
+            token_keep_fraction = base_tok
+        elif task_type == "tool_use":
+            # Mild token compression for tool_use (schemas are protected by slots)
+            token_keep_fraction = 0.65
+            rationale.append("token_budget:0.65:tool_use")
+        elif task_type in ("math", "code") and reasoning_fragility < 0.30:
+            # Very light token compression for low-fragility reasoning tasks
+            token_keep_fraction = 0.72
+            rationale.append(f"token_budget:0.72:{task_type}:low_fragility")
 
         return TargetPrediction(
             compression_band=(round(min_rate, 3), round(max_rate, 3)),
@@ -316,35 +333,17 @@ class TargetPredictor:
                 return True, True, False
 
         elif task_type in _SAFE_TRIM_TASKS:
-            # Retrieval / summarization tasks: use the same fragility thresholds as
-            # reasoning tasks. This is conservative but correct — meeting transcripts
-            # and RAG documents can have dense logical connectors (because/therefore/
-            # since) that, if fragility >= 0.40, indicate trimming is unsafe regardless
-            # of task classification.
-            #
-            # Span-level trimming is disabled entirely for Phase 2A: the clause-level
-            # trimmer can cut fact-bearing clauses (names, decisions, numbers) before
-            # the slot guard has a chance to protect them. It will be re-enabled once
-            # the SpanCritic is trained to produce reliable fragility signals at the
-            # clause level.
-            if reasoning_fragility >= _SECTION_TRIM_MAX_FRAGILITY:
-                rationale.append(
-                    f"safe_trim_task:{task_type}:fragility={reasoning_fragility:.2f}"
-                    f":section+sentence_disabled"
-                )
-                return False, False, False
-            elif reasoning_fragility >= _SENTENCE_TRIM_MAX_FRAGILITY:
-                rationale.append(
-                    f"safe_trim_task:{task_type}:fragility={reasoning_fragility:.2f}"
-                    f":sentence_disabled"
-                )
-                return True, False, False
-            else:
-                rationale.append(
-                    f"safe_trim_task:{task_type}:fragility={reasoning_fragility:.2f}"
-                    f":all_trim_allowed"
-                )
-                return True, True, False
+            # For retrieval / summarization tasks, NEVER gate trimming based on
+            # fragility. Meeting transcripts and RAG docs naturally contain
+            # connector words (because/therefore/since) that inflate the fragility
+            # score, but these are background connectors in retrieved content —
+            # safe to trim. Fragility adjusts HOW aggressive the fractions are
+            # (see sections 6/7 of predict()), not WHETHER we trim at all.
+            rationale.append(
+                f"safe_trim_task:{task_type}:fragility={reasoning_fragility:.2f}"
+                f":always_trim_allowed"
+            )
+            return True, True, False
 
         elif task_type == "tool_use":
             # Tool use: trim background, but protect tool schemas — no span trim
